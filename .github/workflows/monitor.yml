@@ -2,22 +2,19 @@ name: Upwork Job Monitor
 
 on:
   schedule:
-    # UTC時刻で15分おきに実行（GitHub ActionsはUTC基準）
-    # 日本時間 = UTC+9 なので、例えば UTC 0:00 = JST 9:00
     - cron: "*/15 * * * *"
-  workflow_dispatch:  # 手動実行ボタンも有効化
+  workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # sent_jobs.json をコミットするために必要
+      contents: write
 
     steps:
       - name: リポジトリをチェックアウト
         uses: actions/checkout@v4
         with:
-          # 送信済みIDファイルを更新してpushするため、トークンが必要
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Python をセットアップ
@@ -29,11 +26,14 @@ jobs:
       - name: 依存ライブラリをインストール
         run: pip install -r requirements.txt
 
+      - name: Playwright用Chromiumをインストール
+        run: playwright install chromium --with-deps
+
       - name: Upwork監視スクリプトを実行
         env:
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
           LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
-          UPWORK_RSS_URLS: ${{ secrets.UPWORK_RSS_URLS }}
+          UPWORK_SEARCH_URLS: ${{ secrets.UPWORK_SEARCH_URLS }}
         run: python main.py
 
       - name: 送信済みIDファイルをコミット＆プッシュ
@@ -41,6 +41,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add sent_jobs.json || true
-          # 変更がある場合のみコミット
           git diff --staged --quiet || git commit -m "chore: update sent_jobs [skip ci]"
           git push
