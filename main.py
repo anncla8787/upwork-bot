@@ -1,49 +1,17 @@
-import asyncio
 import os
 import json
 import hashlib
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone
-from playwright.async_api import async_playwright
+from urllib.parse import urlparse, urlunparse
 
-# --- 環境変数（GitHub Secrets）から読み込み ---
-LINE_CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-LINE_USER_ID = os.environ["LINE_USER_ID"]
-UPWORK_SEARCH_URLS = os.environ["UPWORK_SEARCH_URLS"]  # カンマ区切りで複数URL指定可
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_USER_ID = os.environ.get("LINE_USER_ID", "")
+UPWORK_SEARCH_URLS = os.environ.get("UPWORK_SEARCH_URLS", "")
 
 SENT_JOBS_FILE = "sent_jobs.json"
 LINE_API_URL = "https://api.line.me/v2/bot/message/push"
-
-# Upwork案件ページのセレクタ候補（構造変更に備えて複数用意）
-TILE_SELECTORS = [
-    "article[data-test='JobTile']",
-    "section[data-test='job-tile']",
-    "div[data-test='job-tile-list-item']",
-    "article.job-tile",
-]
-TITLE_SELECTORS = [
-    "h2 a[href*='/jobs/']",
-    "a[href*='/jobs/~']",
-    "[data-test='job-title'] a",
-    "h2.job-title a",
-]
-DESC_SELECTORS = [
-    "[data-test='job-description-text']",
-    "p[data-test='description']",
-    "div.description",
-]
-BUDGET_SELECTORS = [
-    "[data-test='budget']",
-    "[data-test='is-fixed-price']",
-    "li[data-test='job-type-label']",
-]
-SKILL_SELECTORS = [
-    "[data-test='TokenClamp'] span",
-    "[data-test='skill']",
-    "a[data-test='attr-item']",
-    "span[data-test='attrs-list'] a",
-]
-
 
 def load_sent_jobs() -> set:
     if os.path.exists(SENT_JOBS_FILE):
@@ -51,135 +19,89 @@ def load_sent_jobs() -> set:
             return set(json.load(f).get("sent_ids", []))
     return set()
 
-
 def save_sent_jobs(sent_ids: set) -> None:
     with open(SENT_JOBS_FILE, "w", encoding="utf-8") as f:
         json.dump({"sent_ids": list(sent_ids)[-1000:]}, f, ensure_ascii=False, indent=2)
-
 
 def make_job_id(link: str, title: str) -> str:
     raw = link or title
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
+def convert_to_rss_url(original_url: str) -> str:
+    # ユーザーが検索画面のURLを貼っても、裏側でAPI(RSS)のURLに自動変換するハック
+    parsed = urlparse(original_url)
+    if "/search/jobs" in parsed.path:
+        return urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            "/ab/feed/jobs/rss",
+            parsed.params,
+            parsed.query,
+            parsed.fragment
+        ))
+    return original_url
 
-async def query_first_text(element, selectors: list[str]) -> str:
-    """セレクタ候補を順番に試して最初にマッチした要素のテキストを返す"""
-    for sel in selectors:
-        el = await element.query_selector(sel)
-        if el:
-            return (await el.inner_text()).strip()
-    return ""
+def fetch_jobs(search_url: str) -> list[dict]:
+    rss_url = convert_to_rss_url(search_url)
+    print(f"  [DEBUG] 変換後URL: {rss_url}")
 
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    }
 
-async def fetch_jobs(search_url: str) -> list[dict]:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
-        )
-        page = await context.new_page()
+    response = requests.get(rss_url, headers=headers, timeout=15)
+    response.raise_for_status()
 
-        # 画像・フォントを読み込まないことで高速化
-        await page.route(
-            "**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
-            lambda route: route.abort(),
-        )
+    # XMLとして高速解析
+    soup = BeautifulSoup(response.content, 'xml')
+    items = soup.find_all('item')
 
-        print(f"    ページ読み込み中...")
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
+    print(f"  [DEBUG] 取得できた案件数: {len(items)}件")
 
-        # ログインリダイレクト検出
-        if "/login" in page.url or "/signup" in page.url:
-            print("    ⚠ ログインページにリダイレクトされました。URLを確認してください。")
-            await browser.close()
-            return []
+    jobs = []
+    for item in items:
+        title = item.title.text if item.title else ""
+        link = item.link.text if item.link else ""
+        description = item.description.text if item.description else ""
 
-        # 案件タイルが描画されるまで待機
-        tile_appeared = False
-        for sel in TILE_SELECTORS:
+        if not title:
+            continue
+
+        # descriptionはHTMLタグが含まれるため、テキストのみ抽出
+        desc_soup = BeautifulSoup(description, 'html.parser')
+        clean_desc = desc_soup.get_text(separator=' ').strip()
+
+        # 予算の抽出
+        budget = ""
+        if "Budget:" in clean_desc:
             try:
-                await page.wait_for_selector(sel, timeout=15000)
-                tile_appeared = True
-                break
-            except Exception:
-                continue
+                budget = clean_desc.split("Budget:")[1].split("\n")[0].strip()
+            except:
+                pass
+        elif "Hourly Range:" in clean_desc:
+            try:
+                budget = clean_desc.split("Hourly Range:")[1].split("\n")[0].strip()
+            except:
+                pass
 
-        if not tile_appeared:
-            # JSレンダリングに少し時間を与えて再試行
-            print("    タイルセレクタが見つからず、5秒待機して再試行...")
-            await page.wait_for_timeout(5000)
+        jobs.append({
+            "id": make_job_id(link, title),
+            "title": title,
+            "link": link,
+            "budget": budget[:50] if budget else "記載なし",
+            "summary_short": clean_desc[:200] + "...",
+        })
 
-        # 案件タイルを取得
-        tiles = []
-        matched_selector = ""
-        for sel in TILE_SELECTORS:
-            tiles = await page.query_selector_all(sel)
-            if tiles:
-                matched_selector = sel
-                break
-
-        print(f"    {len(tiles)}件の案件を検出（セレクタ: {matched_selector or 'なし'}）")
-
-        jobs = []
-        for tile in tiles:
-            # タイトルとリンク
-            title, link = "", ""
-            for sel in TITLE_SELECTORS:
-                el = await tile.query_selector(sel)
-                if el:
-                    title = (await el.inner_text()).strip()
-                    href = (await el.get_attribute("href")) or ""
-                    link = f"https://www.upwork.com{href}" if href.startswith("/") else href
-                    break
-
-            if not title:
-                continue
-
-            description = await query_first_text(tile, DESC_SELECTORS)
-            budget = await query_first_text(tile, BUDGET_SELECTORS)
-
-            # スキルは複数要素なので個別処理
-            skills = ""
-            for sel in SKILL_SELECTORS:
-                els = await tile.query_selector_all(sel)
-                if els:
-                    texts = [(await e.inner_text()).strip() for e in els]
-                    skills = ", ".join(t for t in texts if t)
-                    break
-
-            jobs.append({
-                "id": make_job_id(link, title),
-                "title": title,
-                "link": link,
-                "budget": budget,
-                "skills": skills,
-                "summary_short": description[:200],
-            })
-
-        await browser.close()
-        return jobs
-
+    return jobs
 
 def build_line_message(job: dict) -> str:
     lines = ["【新着Upwork案件】", job["title"], ""]
-    if job["budget"]:
+    if job["budget"] != "記載なし":
         lines.append(f"予算: {job['budget']}")
-    if job["skills"]:
-        lines.append(f"スキル: {job['skills']}")
-    if job["summary_short"]:
-        lines.append(f"\n{job['summary_short']}...")
+    lines.append(f"\n{job['summary_short']}")
     lines.append(f"\n{job['link']}")
     return "\n".join(lines)
-
 
 def send_line_message(text: str) -> None:
     headers = {
@@ -195,18 +117,19 @@ def send_line_message(text: str) -> None:
         print(f"LINE送信エラー: {resp.status_code} {resp.text}")
         resp.raise_for_status()
 
-
-async def main_async():
+def main():
     print(f"[{datetime.now(timezone.utc).isoformat()}] 監視開始")
 
     sent_ids = load_sent_jobs()
-    search_urls = [u.strip() for u in UPWORK_SEARCH_URLS.split(",") if u.strip()]
+    
+    # 改行区切りで安全に分割（カンマ分割によるURL破壊を防止）
+    search_urls = [u.strip() for u in UPWORK_SEARCH_URLS.split("\n") if u.strip()]
 
     new_count = 0
     for search_url in search_urls:
         print(f"  スクレイピング中: {search_url[:70]}...")
         try:
-            jobs = await fetch_jobs(search_url)
+            jobs = fetch_jobs(search_url)
         except Exception as e:
             print(f"  スクレイピングエラー: {e}")
             continue
@@ -226,11 +149,6 @@ async def main_async():
 
     save_sent_jobs(sent_ids)
     print(f"完了: {new_count}件の新着案件を通知しました")
-
-
-def main():
-    asyncio.run(main_async())
-
 
 if __name__ == "__main__":
     main()
